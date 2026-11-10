@@ -1,0 +1,36 @@
+[package]
+name = "tgvd"
+version = "0.1.0"
+edition = "2021"
+description = "Telegram video downloader with a multi-task GUI, parallel chunk downloads and resume support"
+
+[lib]
+name = "tgvd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tgvd"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.33"
+rfd = { version = "0.18", default-features = false }
+
+# MTProto (account mode). grammers-session's sqlite storage is disabled on purpose:
+# it drags in libsql (a bundled C SQLite), and we persist the session ourselves instead.
+grammers-client = { version = "0.12", default-features = false, features = ["fs"] }
+grammers-mtsender = "0.12"
+grammers-session = { version = "0.12", default-features = false, features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "io-util", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Message timestamps: grammers hands out `jiff::Timestamp`, and `tz-system`
+# lets the search results show a post date in the user's own time zone.
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

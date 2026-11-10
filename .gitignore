@@ -1,0 +1,16 @@
+# Rust build artefacts
+/target
+
+# Project-local MinGW toolchain (955 MB) — bring your own
+/tools
+
+# Machine-specific linker config, see .cargo/config.toml.example
+/.cargo/config.toml
+
+# Build output
+*.exe
+*.pdb
+build_*.log
+
+# Local runtime data
+*.session

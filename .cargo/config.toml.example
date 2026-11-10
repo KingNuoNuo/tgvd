@@ -1,0 +1,20 @@
+# Machine-specific linker settings.
+#
+# Copy this file to `.cargo/config.toml` only if you need a non-default linker
+# (the file is git-ignored on purpose — it holds absolute-ish local paths).
+#
+# This project was developed on Windows 11 with no MSVC C++ toolchain installed,
+# so it builds for the GNU target with a MinGW-w64 toolchain unpacked into
+# `tools/mingw/`:
+#
+#   cargo build --release --target x86_64-pc-windows-gnu
+#   cargo test  --target x86_64-pc-windows-gnu
+#
+# If you already have `x86_64-w64-mingw32-gcc` on PATH, you do not need this
+# file at all — Cargo picks the GNU linker up automatically.
+
+[target.x86_64-pc-windows-gnu]
+linker = "tools/mingw/mingw64/bin/x86_64-w64-mingw32-gcc.exe"
+ar = "tools/mingw/mingw64/bin/ar.exe"
+# No MinGW runtime DLLs next to the exe: ship a single self-contained binary.
+rustflags = ["-C", "link-arg=-static"]

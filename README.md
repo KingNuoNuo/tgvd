@@ -2,6 +2,9 @@
 
 > 一个 Windows 单文件 GUI，用 **MTProto 账号**直连 Telegram，批量下载频道 / 群里的视频：频道内关键字搜索 → 勾选 → 排队下载，多任务、多段并发、断点续传，全程不依赖任何第三方解析站。
 
+[![build](https://github.com/KingNuoNuo/tgvd/actions/workflows/build.yml/badge.svg)](https://github.com/KingNuoNuo/tgvd/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/KingNuoNuo/tgvd?display_name=tag&sort=semver)](https://github.com/KingNuoNuo/tgvd/releases/latest)
+
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
 ![rust](https://img.shields.io/badge/Rust-edition%202021-CE422B)
 ![ui](https://img.shields.io/badge/GUI-egui%2Feframe-1F6FEB)
@@ -32,6 +35,8 @@ TGVD 走的是**真·账号通道**：和官方客户端一样用 MTProto 登录
 
 ## 使用
 
+**不想自己编译**：直接到 [Releases](https://github.com/KingNuoNuo/tgvd/releases/latest) 下 `TGVD-<版本>-windows-x64.exe`，双击就能用。也可以从 [Actions](https://github.com/KingNuoNuo/tgvd/actions/workflows/build.yml) 里随便挑一次成功构建，下载 artifact 的压缩包。
+
 1. **准备 api_id / api_hash**：到 <https://my.telegram.org> 建一个应用。程序里预填了一组公开的桌面端参数，能直接登录；长期用建议换成自己的。
 2. **登录**：填手机号（国际格式 `+86…`）→ 收验证码 → 有二步密码的再输一次。凭证存在 `%APPDATA%\TGVD\tgvd.session`，之后启动自动恢复，换 exe / 换目录都不掉登录。
 3. **搜索**：侧栏「搜索」→ 填频道（`@channel` 或 `t.me/channel`）→ 可选关键字 → 搜索 → 勾选 → 「下载选中」。
@@ -47,6 +52,17 @@ TGVD 走的是**真·账号通道**：和官方客户端一样用 MTProto 登录
 | 输出目录 | 默认 `~/Downloads/TGVD`，下载中写 `.part`，全部字节到齐才改名成正式文件 |
 
 ## 构建
+
+### 云端构建（不装任何东西）
+
+推到 GitHub 就自动编，配置在 `.github/workflows/build.yml`：
+
+- 推 `main` 或手动点 **Run workflow** → 编好放在 Actions 的 artifact 里（保留 30 天）
+- 推 `v*` tag → 编完自动建 Release 并把 exe 挂上去
+
+用的是 `windows-latest` 自带的 MSVC 工具链，加 `-C target-feature=+crt-static` 静态链接 CRT，所以产物不挑机器、不需要装 VC++ 运行库。
+
+### 本地构建
 
 需要 Rust 1.75+。Windows 上 MSVC 或 GNU 两种工具链都可以：
 
@@ -112,5 +128,7 @@ Built with Rust, `eframe`/`egui` and `grammers` (pure-Rust MTProto). No external
 ```bash
 cargo build --release --target x86_64-pc-windows-gnu
 ```
+
+Prebuilt binaries are produced by GitHub Actions on every push (`.github/workflows/build.yml`, MSVC + static CRT) and attached to each release, so end users can skip the toolchain entirely.
 
 > Note: Telegram media is delivered through the `upload.getFile` RPC, not HTTP — that is why aria2 or any HTTP downloader cannot be used as the backend. Each datacenter also gets a single TCP connection from `grammers-mtsender`, which caps how much parallelism actually helps.

@@ -11,6 +11,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# GITHUB_TOKEN 默认是只读的。建 Release 要写权限，不给就会 403
+# "Resource not accessible by integration"。只开 contents，别的都不开。
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
   TARGET: x86_64-pc-windows-msvc

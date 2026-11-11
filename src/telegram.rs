@@ -146,12 +146,29 @@ pub enum Cmd {
         /// Optional server-side keyword: when set, the channel is searched
         /// instead of walking its most recent messages.
         keyword: String,
+        /// Smallest id that is still free. The UI restores a task list across
+        /// restarts, so the engine must not hand out ids that are already shown
+        /// for a restored row — two rows sharing an id would be mixed up by
+        /// every progress event.
+        min_id: u64,
     },
     /// Re-queue finished/failed tasks; a partially written file resumes.
     Retry(Vec<u64>),
     /// Cancel these tasks (the `.part` file is kept for a later resume).
     Stop(Vec<u64>),
     StopAll,
+    /// Applies "同时下载几个文件" to the engine that is already running.
+    /// Without this the slider only took effect the next time a download was
+    /// queued, which looked like "改了设置没反应".
+    SetFiles { files: usize },
+    /// (Re)starts tasks. Ones the engine still knows are re-queued as-is; ones
+    /// that only survive in the saved list get their post re-read from the link.
+    Start {
+        reqs: Vec<StartReq>,
+        /// Concurrency to use if this is the first command of the session and
+        /// the engine has to be created here.
+        files: usize,
+    },
     /// Reads a channel — or searches inside it when `keyword` is set — and
     /// reports every hit as `Ev::SearchHit`. Nothing is downloaded yet: the user
     /// ticks the ones they want and sends `DownloadPicked`, so a big channel is
@@ -168,6 +185,8 @@ pub enum Cmd {
         overwrite: bool,
         files: usize,
         segments: usize,
+        /// See `Cmd::Add::min_id`.
+        min_id: u64,
     },
     /// Forget the saved credentials (server-side log out + delete the file).
     Logout,
@@ -194,6 +213,25 @@ pub struct TaskInfo {
     pub size: u64,
     pub link: String,
     pub path: String,
+    /// Parallel streams this task uses. Saved together with the task list so a
+    /// restored task rebuilds the *same* segment plan — `download_file` only
+    /// accepts a `.tgvd` whose segment count matches, and a different plan would
+    /// silently throw the partial file away and start over.
+    pub segments: usize,
+}
+
+/// A task being restarted from the saved list (the engine no longer has its
+/// `Spec` after a restart, and `Spec.media` cannot be serialised).
+///
+/// Carries just enough to re-resolve the post and rebuild the spec under the
+/// original id, name and path, so the `.part` / `.tgvd` on disk continues.
+#[derive(Clone)]
+pub struct StartReq {
+    pub id: u64,
+    pub name: String,
+    pub link: String,
+    pub path: String,
+    pub segments: usize,
 }
 
 pub enum Ev {
@@ -461,6 +499,7 @@ async fn run(ev: mpsc::Sender<Ev>, mut rx: UnboundedReceiver<Cmd>, session_path:
                 files,
                 segments,
                 keyword,
+                min_id,
             } => {
                 let Some(c) = client.clone() else {
                     log("请先在「设置」里登录账号".into());
@@ -474,7 +513,7 @@ async fn run(ev: mpsc::Sender<Ev>, mut rx: UnboundedReceiver<Cmd>, session_path:
                 }
                 let eng = match &engine {
                     Some(e) => {
-                        e.set_files(files);
+                        let _ = e.set_files(files);
                         e.clone()
                     }
                     None => {
@@ -483,6 +522,7 @@ async fn run(ev: mpsc::Sender<Ev>, mut rx: UnboundedReceiver<Cmd>, session_path:
                         e
                     }
                 };
+                eng.reserve_ids(min_id);
                 let cfg = DlCfg {
                     out_dir,
                     overwrite,
@@ -572,6 +612,7 @@ async fn run(ev: mpsc::Sender<Ev>, mut rx: UnboundedReceiver<Cmd>, session_path:
                 overwrite,
                 files,
                 segments,
+                min_id,
             } => {
                 let Some(c) = client.clone() else {
                     log("请先在「设置」里登录账号".into());
@@ -590,7 +631,7 @@ async fn run(ev: mpsc::Sender<Ev>, mut rx: UnboundedReceiver<Cmd>, session_path:
                 }
                 let eng = match &engine {
                     Some(e) => {
-                        e.set_files(files);
+                        let _ = e.set_files(files);
                         e.clone()
                     }
                     None => {
@@ -599,6 +640,7 @@ async fn run(ev: mpsc::Sender<Ev>, mut rx: UnboundedReceiver<Cmd>, session_path:
                         e
                     }
                 };
+                eng.reserve_ids(min_id);
                 let cfg = DlCfg {
                     out_dir,
                     overwrite,
@@ -613,6 +655,62 @@ async fn run(ev: mpsc::Sender<Ev>, mut rx: UnboundedReceiver<Cmd>, session_path:
                     enqueue_item(&eng, item, &cfg);
                 }
                 let _ = ev.send(Ev::ResolveDone);
+            }
+
+            Cmd::SetFiles { files } => {
+                // The engine may not exist yet (nothing queued so far); in that
+                // case there is nothing to throttle and the next `Add` already
+                // carries the fresh value.
+                if let Some(e) = &engine {
+                    let want = files.clamp(1, 8) as usize;
+                    if e.set_files(want) {
+                        log(format!("同时下载文件数改为 {want}"));
+                    }
+                }
+            }
+
+            Cmd::Start { reqs, files } => {
+                let Some(c) = client.clone() else {
+                    log("请先在「设置」里登录账号".into());
+                    continue;
+                };
+                let eng = match &engine {
+                    Some(e) => {
+                        let _ = e.set_files(files);
+                        e.clone()
+                    }
+                    None => {
+                        let e = Arc::new(Engine::new(c.clone(), ev.clone(), files));
+                        engine = Some(e.clone());
+                        e
+                    }
+                };
+                let mut need: Vec<StartReq> = Vec::new();
+                for r in reqs {
+                    match eng.spec(r.id) {
+                        // Same session, engine still holds the media handle.
+                        Some(sp) => {
+                            let _ = ev.send(Ev::Status {
+                                id: r.id,
+                                status: "排队中".into(),
+                            });
+                            queue_file(eng.clone(), sp);
+                        }
+                        // Only in the saved list: the post has to be read again.
+                        None => need.push(r),
+                    }
+                }
+                if !need.is_empty() {
+                    log(format!("正在恢复 {} 个任务…", need.len()));
+                    let ev2 = ev.clone();
+                    tokio::spawn(async move {
+                        for r in need {
+                            resume_one(eng.clone(), c.clone(), r).await;
+                        }
+                        let _ = ev2.send(Ev::ResolveDone);
+                        let _ = ev2.send(Ev::Stage("空闲".into()));
+                    });
+                }
             }
 
             Cmd::Retry(ids) => match &engine {
@@ -1060,20 +1158,61 @@ impl Engine {
         }
     }
 
-    /// Changing "同时下载几个" only affects tasks queued from now on; files that
-    /// are already running keep their permit and finish normally.
-    fn set_files(&self, files: usize) {
+    /// Changes the "同时下载几个文件" limit on a live engine.
+    ///
+    /// Permits are added or taken away in place rather than swapping in a new
+    /// `Semaphore`: a fresh semaphore starts out full, so files that were
+    /// already running would keep their old permit *on top of* the new budget
+    /// and the real concurrency would overshoot (8 running + a new 8 = 16).
+    /// A file that is already transferring is never interrupted; the new limit
+    /// applies to whatever is queued behind it.
+    ///
+    /// Returns whether the limit actually changed.
+    fn set_files(&self, files: usize) -> bool {
         let want = files.clamp(1, 8) as u32;
-        if self.permits.swap(want, Ordering::Relaxed) == want {
-            return;
+        let prev = self.permits.swap(want, Ordering::Relaxed);
+        if prev == want {
+            return false;
         }
-        if let Ok(mut g) = self.sem.lock() {
-            *g = Arc::new(Semaphore::new(want as usize));
+        if let Ok(sem) = self.sem.lock() {
+            if want > prev {
+                sem.add_permits((want - prev) as usize);
+            } else {
+                // Only reclaims free slots; the permits already held by running
+                // files stay valid, so nothing gets cancelled.
+                sem.forget_permits((prev - want) as usize);
+            }
         }
+        true
     }
 
     fn spec(&self, id: u64) -> Option<Arc<Spec>> {
         self.reg.lock().ok()?.specs.get(&id).cloned()
+    }
+
+    /// Registers a spec under an id that came from the saved list.
+    ///
+    /// `next_id` is widened so a task added later cannot take the same id, and
+    /// the file name is marked as used so `unique_name` will not hand the same
+    /// name (and therefore the same `.part`) to a second task.
+    fn adopt(&self, spec: Arc<Spec>) {
+        if let Ok(mut r) = self.reg.lock() {
+            let id = spec.id;
+            r.next_id = r.next_id.max(id + 1);
+            r.names.insert(spec.name.clone());
+            r.specs.insert(id, spec);
+        }
+    }
+
+    /// Keeps freshly created ids above the ones the UI already shows, so a task
+    /// added after a restart cannot collide with a restored row.
+    fn reserve_ids(&self, from: u64) {
+        if from == 0 {
+            return;
+        }
+        if let Ok(mut r) = self.reg.lock() {
+            r.next_id = r.next_id.max(from);
+        }
     }
 
     fn stop(&self, id: u64) {
@@ -1173,8 +1312,96 @@ fn enqueue_item(eng: &Arc<Engine>, item: Item, cfg: &DlCfg) {
         size: spec.size,
         link: spec.link.clone(),
         path: spec.dest.to_string_lossy().to_string(),
+        segments: spec.plan.len(),
     }));
     queue_file(eng.clone(), spec);
+}
+
+/// `(size, segment count)` recorded for a partially downloaded file.
+fn read_resume(dest: &Path) -> Option<(u64, usize)> {
+    let bytes = std::fs::read(state_path(dest)).ok()?;
+    let st: ResumeState = serde_json::from_slice(&bytes).ok()?;
+    Some((st.size, st.segs.len()))
+}
+
+/// Rebuilds one task that only exists in the saved list.
+///
+/// `Spec.media` is a live MTProto handle and cannot be stored on disk, so the
+/// post is read again from the link. Everything else — id, file name, path,
+/// segment plan — is restored exactly as it was, which is what lets the
+/// transfer continue from the bytes already in the `.part` file.
+async fn resume_one(eng: Arc<Engine>, client: Client, req: StartReq) {
+    let ev = eng.ev.clone();
+    let fail = |msg: String, status: &str| {
+        let _ = ev.send(Ev::Log(msg));
+        let _ = ev.send(Ev::Done {
+            id: req.id,
+            status: status.to_string(),
+        });
+    };
+
+    let target = match parse_target(&req.link) {
+        Ok(t) => t,
+        Err(e) => return fail(format!("{}: 链接解析失败（{e}）", req.name), "错误: 链接无效"),
+    };
+    if target.post.is_none() {
+        return fail(
+            format!("{}: 保存的链接里没有消息 id，没法重新定位", req.name),
+            "错误: 链接不完整",
+        );
+    }
+
+    let item = match collect_videos(&client, &target, 1, "", &ev).await {
+        Ok(mut list) => match list.pop() {
+            Some(it) => it,
+            None => {
+                return fail(
+                    format!("{}: 帖子还在，但已经取不到视频", req.name),
+                    "错误: 取不到视频",
+                )
+            }
+        },
+        Err(e) => return fail(format!("{}: {e}", req.name), "错误: 重新获取失败"),
+    };
+
+    let dest = PathBuf::from(&req.path);
+    // Trust the resume file over the message when both are available: those are
+    // the numbers `download_file` compares against, so this is what guarantees
+    // "continues" instead of "starts over".
+    let (size, segments) = match read_resume(&dest) {
+        Some((size, n)) if n > 0 => (size, n),
+        _ => (item.size, req.segments.max(1)),
+    };
+    let plan = plan_segments(size, segments);
+    let spec = Arc::new(Spec {
+        id: req.id,
+        link: req.link.clone(),
+        name: req.name.clone(),
+        size,
+        media: item.media,
+        part: part_path(&dest),
+        state: state_path(&dest),
+        dest,
+        // A finished file should report "已存在" rather than being fetched
+        // again; a `.part` still resumes normally either way.
+        overwrite: false,
+        shared: Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            conns: AtomicU32::new(0),
+            segs: plan.iter().map(|_| AtomicU64::new(0)).collect(),
+        }),
+        plan,
+    });
+    eng.adopt(spec.clone());
+    let _ = ev.send(Ev::Added(TaskInfo {
+        id: req.id,
+        name: req.name.clone(),
+        size,
+        link: req.link.clone(),
+        path: req.path.clone(),
+        segments,
+    }));
+    queue_file(eng, spec);
 }
 
 /// Waits for a free slot and then downloads. Several of these run at the same

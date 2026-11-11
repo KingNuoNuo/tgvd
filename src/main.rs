@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Color32, RichText};
-use tgvd::telegram::{self, Cmd as TgCmd, Ev as TgEv, SearchHit, TaskInfo};
+use tgvd::telegram::{self, Cmd as TgCmd, Ev as TgEv, SearchHit, StartReq, TaskInfo};
 use tokio::sync::mpsc::UnboundedSender;
 
 fn main() -> eframe::Result {
@@ -182,6 +182,9 @@ struct Task {
     conns: u32,
     link: String,
     path: String,
+    /// Parallel streams this task was queued with. Saved with the task list so a
+    /// restored task rebuilds the same segment plan and can resume its `.tgvd`.
+    segments: usize,
 }
 
 impl Task {
@@ -297,6 +300,157 @@ fn settings_path() -> PathBuf {
     telegram::session_path().with_file_name("settings.json")
 }
 
+// ---------------------------------------------------------------- task list
+//
+// The queue used to live in memory only, so closing the window threw the whole
+// download list away. It is mirrored to `tasks.json` beside the settings, and a
+// restored row can be started again from its link (see `Cmd::Start`).
+
+fn tasks_path() -> PathBuf {
+    telegram::session_path().with_file_name("tasks.json")
+}
+
+fn default_segments() -> usize {
+    8
+}
+
+/// One row of `tasks.json`. Flat and forgiving on purpose: unknown fields are
+/// ignored and missing ones fall back to defaults, so a list written by an older
+/// build still loads instead of being silently dropped.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TaskRec {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    done: u64,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    link: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default = "default_segments")]
+    segments: usize,
+}
+
+fn load_tasks() -> Vec<Task> {
+    let Ok(bytes) = std::fs::read(tasks_path()) else {
+        return Vec::new();
+    };
+    let recs: Vec<TaskRec> = serde_json::from_slice(&bytes).unwrap_or_default();
+    let mut out: Vec<Task> = recs
+        .into_iter()
+        .filter(|r| !r.name.is_empty() && !r.path.is_empty())
+        .map(|r| {
+            let parked = r.status.is_empty() || r.status == "下载中" || r.status == "排队中";
+            let mut t = Task {
+                id: r.id,
+                name: r.name,
+                size: r.size,
+                done: r.done,
+                // Nothing survives a restart as "running": a task that was
+                // mid-transfer is shown as stopped so it can be restarted.
+                status: if parked { "已停止".into() } else { r.status },
+                speed: 0.0,
+                conns: 0,
+                link: r.link,
+                path: r.path,
+                segments: r.segments.max(1),
+            };
+            reconcile(&mut t);
+            t
+        })
+        .collect();
+    out.sort_by_key(|t| t.id);
+    out
+}
+
+/// Brings a restored row in line with what is actually on disk.
+///
+/// The JSON is written at most once a second and not at all when the app is
+/// killed, so the file may lag behind: a finished download should still show as
+/// finished, and a half-written one should show the bytes it really has.
+fn reconcile(t: &mut Task) {
+    let dest = std::path::Path::new(&t.path);
+    if let Ok(meta) = std::fs::metadata(dest) {
+        if meta.is_file() {
+            let len = meta.len();
+            if t.size == 0 || len >= t.size {
+                t.size = len.max(t.size);
+                t.done = t.size;
+                t.status = "完成".into();
+                t.speed = 0.0;
+                t.conns = 0;
+                return;
+            }
+        }
+    }
+    if t.is_done() {
+        return;
+    }
+    let name = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let state = dest.with_file_name(format!("{name}.part.tgvd"));
+    let Ok(bytes) = std::fs::read(&state) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    if let Some(segs) = v.get("segs").and_then(|s| s.as_array()) {
+        let sum: u64 = segs.iter().filter_map(|x| x.as_u64()).sum();
+        if sum > 0 {
+            t.done = sum;
+        }
+        // The segment count has to match or the resume is thrown away, so take
+        // it from the file rather than from the (possibly older) record.
+        if !segs.is_empty() {
+            t.segments = segs.len();
+        }
+    }
+    if let Some(size) = v.get("size").and_then(|x| x.as_u64()) {
+        if size > 0 {
+            t.size = size;
+        }
+    }
+}
+
+fn save_tasks(tasks: &[Task]) {
+    let recs: Vec<TaskRec> = tasks
+        .iter()
+        .map(|t| TaskRec {
+            id: t.id,
+            name: t.name.clone(),
+            size: t.size,
+            // An in-flight task's `done` is a snapshot; `reconcile` re-reads the
+            // real number from the `.tgvd` file on the next start anyway.
+            done: t.done,
+            status: t.status.clone(),
+            link: t.link.clone(),
+            path: t.path.clone(),
+            segments: t.segments,
+        })
+        .collect();
+    let Ok(text) = serde_json::to_vec_pretty(&recs) else {
+        return;
+    };
+    let path = tasks_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Write beside the target and rename: being killed mid-write would otherwise
+    // leave a truncated file that loads as an empty list, which reads exactly
+    // like "the history disappeared again".
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
 // ---------------------------------------------------------------- app
 
 struct App {
@@ -344,6 +498,12 @@ struct App {
     probe_dl: bool,
 
     settings_dirty_at: Option<Instant>,
+    /// Set when the task list changed and needs writing to `tasks.json`.
+    tasks_dirty_at: Option<Instant>,
+    /// A change worth writing immediately (a task appeared, finished or was
+    /// removed) rather than in the next throttled tick. Progress-only updates
+    /// stay throttled.
+    tasks_urgent: bool,
 }
 
 impl App {
@@ -361,7 +521,7 @@ impl App {
             page: Page::Downloads,
             dark: settings.dark,
             settings,
-            tasks: Vec::new(),
+            tasks: load_tasks(),
             selected: HashSet::new(),
             current: None,
             logs: Vec::new(),
@@ -393,8 +553,23 @@ impl App {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
             settings_dirty_at: None,
+            tasks_dirty_at: None,
+            tasks_urgent: false,
         };
         app.push_log(format!("输出目录：{}", app.settings.out_dir));
+        if !app.tasks.is_empty() {
+            let left = app.tasks.iter().filter(|t| !t.is_done()).count();
+            app.push_log(format!(
+                "已恢复上次的下载列表：{} 个任务{}",
+                app.tasks.len(),
+                if left > 0 {
+                    format!("，其中 {left} 个没下完，选中后点「开始」可以接着下")
+                } else {
+                    String::new()
+                }
+            ));
+            app.current = app.tasks.first().map(|t| t.id);
+        }
 
         // Debug aid: see `seed_demo`. Values 2/3 also open the dialog / settings
         // page, so the layout can be checked without a mouse.
@@ -464,6 +639,7 @@ https://t.me/s/telegram/441".into();
                     .join(name.to_string())
                     .to_string_lossy()
                     .to_string(),
+                segments: 8,
             });
         }
         self.selected.insert(1);
@@ -505,6 +681,13 @@ https://t.me/s/telegram/441".into();
         let _ = self.tg_tx.send(cmd);
     }
 
+    /// Sends a command without arming the "正在…" indicator — used by settings
+    /// that apply immediately, where there is nothing to wait for. Dragging the
+    /// concurrency slider would otherwise leave the UI spinning for 30s.
+    fn tg_send_quiet(&mut self, cmd: TgCmd) {
+        let _ = self.tg_tx.send(cmd);
+    }
+
     fn tg_pending(&self) -> bool {
         self.tg_pending_until
             .map(|t| Instant::now() < t)
@@ -536,8 +719,46 @@ https://t.me/s/telegram/441".into();
         }
     }
 
+    fn touch_tasks(&mut self) {
+        if self.tasks_dirty_at.is_none() {
+            self.tasks_dirty_at = Some(Instant::now());
+        }
+    }
+
+    /// A state change that must hit the disk on this very frame.
+    fn touch_tasks_now(&mut self) {
+        self.tasks_urgent = true;
+    }
+
+    /// Mirrors the queue to disk.
+    ///
+    /// Progress updates are throttled to one write a second (there is one every
+    /// 300 ms per task), but anything that changes a *status* is written at once:
+    /// the window hook cannot be relied on to fire, and losing "this task
+    /// finished / was removed" for a second is what makes a list look stale.
+    fn flush_tasks(&mut self) {
+        if self.tasks_urgent {
+            save_tasks(&self.tasks);
+            self.tasks_urgent = false;
+            self.tasks_dirty_at = None;
+            return;
+        }
+        if let Some(t) = self.tasks_dirty_at {
+            if t.elapsed() >= Duration::from_millis(1000) {
+                save_tasks(&self.tasks);
+                self.tasks_dirty_at = None;
+            }
+        }
+    }
+
     fn task(&self, id: u64) -> Option<&Task> {
         self.tasks.iter().find(|t| t.id == id)
+    }
+
+    /// Ids already on screen — restored rows included — have to stay unique, so
+    /// new tasks must start above the highest one.
+    fn next_task_id(&self) -> u64 {
+        self.tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1
     }
 
     fn selected_ids(&self) -> Vec<u64> {
@@ -607,11 +828,25 @@ https://t.me/s/telegram/441".into();
                 }
                 TgEv::Added(info) => {
                     let id = info.id;
-                    self.tasks.push(Task::from(info));
+                    // A task restored from `tasks.json` already has a row; the
+                    // engine's `Added` only fills in the live details, so update
+                    // it instead of appending a duplicate line.
+                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+                        t.size = info.size;
+                        t.link = info.link;
+                        t.path = info.path;
+                        t.segments = info.segments;
+                        if !t.is_done() {
+                            t.status = "排队中".into();
+                        }
+                    } else {
+                        self.tasks.push(Task::from(info));
+                    }
                     self.tg_done();
                     if self.current.is_none() {
                         self.current = Some(id);
                     }
+                    self.touch_tasks_now();
                 }
                 TgEv::Progress {
                     id,
@@ -639,6 +874,7 @@ https://t.me/s/telegram/441".into();
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                         t.status = status;
                     }
+                    self.touch_tasks_now();
                 }
                 TgEv::Done { id, status } => {
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
@@ -649,6 +885,7 @@ https://t.me/s/telegram/441".into();
                         t.conns = 0;
                         t.status = status;
                     }
+                    self.touch_tasks_now();
                 }
                 TgEv::ResolveDone => {
                     self.resolving = false;
@@ -684,6 +921,10 @@ https://t.me/s/telegram/441".into();
                 }
             }
         }
+        if any {
+            // Any event may have touched a row; the write itself is throttled.
+            self.touch_tasks();
+        }
         any
     }
 
@@ -712,6 +953,7 @@ https://t.me/s/telegram/441".into();
             self.settings.files,
             self.settings.segments
         ));
+        let min_id = self.next_task_id();
         self.tg_send(TgCmd::Add {
             links,
             limit: self.settings.limit.max(1) as usize,
@@ -722,6 +964,7 @@ https://t.me/s/telegram/441".into();
             // Keyword searching has its own page now; a pasted link means
             // "queue whatever this channel has".
             keyword: String::new(),
+            min_id,
         });
         self.add_links.clear();
         self.add_open = false;
@@ -765,12 +1008,14 @@ https://t.me/s/telegram/441".into();
             self.settings.files,
             self.settings.segments
         ));
+        let min_id = self.next_task_id();
         self.tg_send(TgCmd::DownloadPicked {
             picks,
             out_dir: PathBuf::from(self.settings.out_dir.trim()),
             overwrite: self.settings.overwrite,
             files: self.settings.files as usize,
             segments: self.settings.segments as usize,
+            min_id,
         });
         self.hit_sel.clear();
         self.page = Page::Downloads;
@@ -780,10 +1025,17 @@ https://t.me/s/telegram/441".into();
     /// skipped, and so is anything already finished — re-queueing those would
     /// put a second writer on the same `.part` file.
     fn start(&mut self, ids: Vec<u64>) {
-        let runnable: Vec<u64> = ids
+        let runnable: Vec<StartReq> = ids
             .iter()
-            .copied()
-            .filter(|id| self.task(*id).is_some_and(|t| t.is_resumable()))
+            .filter_map(|id| self.task(*id))
+            .filter(|t| t.is_resumable())
+            .map(|t| StartReq {
+                id: t.id,
+                name: t.name.clone(),
+                link: t.link.clone(),
+                path: t.path.clone(),
+                segments: t.segments,
+            })
             .collect();
         if runnable.is_empty() {
             if !ids.is_empty() {
@@ -795,11 +1047,38 @@ https://t.me/s/telegram/441".into();
         if skipped > 0 {
             self.push_log(format!("跳过 {skipped} 个正在下载/已完成的任务"));
         }
-        self.push_log(format!(
-            "开始 {} 个任务（已下载的部分会续传，不会重下）",
-            runnable.len()
-        ));
-        self.tg_send(TgCmd::Retry(runnable));
+        // Tasks restored from the saved list have no engine-side spec yet; the
+        // worker re-reads their post from the link, then resumes the `.part`.
+        let restored = runnable
+            .iter()
+            .filter(|r| {
+                self.tasks
+                    .iter()
+                    .any(|t| t.id == r.id && t.status == "已停止" && t.done > 0)
+            })
+            .count();
+        self.push_log(if restored > 0 {
+            format!(
+                "开始 {} 个任务（{} 个需要重新连接，都已下载的部分会续传）",
+                runnable.len(),
+                restored
+            )
+        } else {
+            format!("开始 {} 个任务（已下载的部分会续传，不会重下）", runnable.len())
+        });
+        // Optimistic flip: a restored task stays "已停止" until the engine has
+        // re-read its post, and clicking 开始 twice in that window would queue
+        // the same file twice.
+        for r in &runnable {
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == r.id) {
+                t.status = "排队中".into();
+            }
+        }
+        self.touch_tasks_now();
+        self.tg_send(TgCmd::Start {
+            reqs: runnable,
+            files: self.settings.files as usize,
+        });
     }
 
     fn stop(&mut self, ids: Vec<u64>) {
@@ -840,24 +1119,82 @@ https://t.me/s/telegram/441".into();
             }
         }
         self.push_log("已从列表移除（磁盘上的文件不会被删除）".into());
+        // Removing a row produces no engine event, so nothing would mark the
+        // list dirty on its own.
+        self.touch_tasks_now();
     }
 
-    fn open_path(&self, path: &str) {
-        let p = std::path::Path::new(path);
-        if p.is_file() {
-            let parent = p.parent().map(|d| d.to_string_lossy().to_string());
-            let _ = std::process::Command::new("explorer")
-                .arg(format!("/select,{}", path))
-                .spawn();
-            if let Some(d) = parent {
-                if !std::path::Path::new(&d).exists() {
-                    let _ = std::process::Command::new("explorer").arg(&d).spawn();
-                }
+    /// Reveals a file, or opens a folder, in Explorer.
+    ///
+    /// A task that is still downloading has no final file on disk yet — only
+    /// `xxx.mp4.part` — so handing its target path straight to `explorer` made
+    /// Explorer open "此电脑" or whatever folder it last remembered, which is
+    /// why 「打开文件夹」 looked like it opened the wrong place. Resolve to
+    /// something that actually exists first, and say what got opened.
+    fn open_path(&mut self, path: &str) {
+        let mut p = PathBuf::from(path.trim());
+        if p.as_os_str().is_empty() {
+            self.push_log("路径是空的，没法打开".into());
+            return;
+        }
+        if p.is_relative() {
+            if let Ok(cwd) = std::env::current_dir() {
+                p = cwd.join(&p);
             }
-        } else {
-            let _ = std::process::Command::new("explorer").arg(path).spawn();
+        }
+        let label = p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.trim().to_string());
+
+        if p.is_dir() {
+            open_folder(&p);
+            return;
+        }
+        if p.is_file() {
+            select_in_folder(&p);
+            return;
+        }
+        // Still downloading: the only thing on disk is the temp file, and
+        // pointing Explorer at it is more useful than opening the bare folder.
+        let part = PathBuf::from(format!("{}.part", p.display()));
+        if part.is_file() {
+            select_in_folder(&part);
+            self.push_log(format!("{label} 还没下完，已在文件夹里选中它的 .part 临时文件"));
+            return;
+        }
+        // Nothing there yet (queued / stopped / failed / wrong path): fall back
+        // to the nearest existing parent instead of letting Explorer guess.
+        match p.ancestors().skip(1).find(|d| d.is_dir()) {
+            Some(d) => {
+                open_folder(d);
+                self.push_log(format!(
+                    "{label} 还不存在，已打开它所在的目录 {}",
+                    d.display()
+                ));
+            }
+            None => self.push_log(format!(
+                "找不到 {path} 对应的目录，可能已经被删掉或移走了"
+            )),
         }
     }
+}
+
+/// Opens a folder in Explorer. `arg` lets Rust apply the quoting the path needs.
+fn open_folder(dir: &std::path::Path) {
+    let _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
+}
+
+/// `explorer /select,"<path>"`: the quotes must wrap **only** the path.
+///
+/// Letting `Command` quote the whole argument on its own yields
+/// `"/select,C:\a b\x.mp4"`, which Explorer does not parse — it silently opens
+/// the default folder instead. `raw_arg` lets us place the quotes ourselves.
+fn select_in_folder(file: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = std::process::Command::new("explorer.exe");
+    cmd.raw_arg(format!("/select,\"{}\"", file.display()));
+    let _ = cmd.spawn();
 }
 
 impl From<TaskInfo> for Task {
@@ -872,6 +1209,7 @@ impl From<TaskInfo> for Task {
             conns: 0,
             link: i.link,
             path: i.path,
+            segments: i.segments,
         }
     }
 }
@@ -1552,9 +1890,10 @@ impl App {
                 self.stop(ids.clone());
             }
             if btn(ui, "打开文件夹", has) {
-                if let Some(t) = self.task(ids[0]) {
-                    let path = t.path.clone();
-                    self.open_path(&path);
+                // `cloned` so the borrow of `self.tasks` ends before `open_path`
+                // takes `&mut self`.
+                if let Some(t) = self.task(ids[0]).cloned() {
+                    self.open_path(&t.path);
                 }
             }
             if btn(ui, "复制链接", has) {
@@ -1904,7 +2243,10 @@ impl App {
                 // ---- download
                 ui.label(RichText::new("下载").size(14.0).strong().color(p.text));
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("保存到").size(12.0).color(p.weak));
+                    ui.label(RichText::new("保存到").size(12.0).color(p.weak))
+                        .on_hover_text(
+                            "改完之后新加入队列的任务才用新目录；已经在列表里的任务还是原来那个",
+                        );
                     if ui
                         .add(
                             egui::TextEdit::singleline(&mut self.settings.out_dir)
@@ -1922,6 +2264,14 @@ impl App {
                     }
                     if ui.button("打开").clicked() {
                         let d = self.settings.out_dir.trim().to_string();
+                        // The folder is only created when the first download
+                        // starts, so a brand-new path used to fall back to its
+                        // parent. Create it here instead.
+                        if !d.is_empty() && !std::path::Path::new(&d).exists() {
+                            if let Err(e) = std::fs::create_dir_all(&d) {
+                                self.push_log(format!("创建目录 {d} 失败：{e}"));
+                            }
+                        }
                         self.open_path(&d);
                     }
                 });
@@ -1939,6 +2289,12 @@ impl App {
                                 .changed()
                             {
                                 self.touch_settings();
+                                // Push it to the live engine right away: the
+                                // slider used to only reach the engine the next
+                                // time something was queued, so changing it
+                                // mid-download did nothing at all.
+                                let n = self.settings.files as usize;
+                                self.tg_send_quiet(TgCmd::SetFiles { files: n });
                             }
                             ui.label(
                                 RichText::new("几个文件同时下载")
@@ -2002,7 +2358,7 @@ impl App {
                 });
                 ui.label(
                     RichText::new(
-                        "「同时下载」指几个文件并行；「单文件连接」指一个文件切几段同时拉。都调高更快，也更吃带宽。",
+                        "「同时下载」指几个文件并行，拖动后立即生效（已经在下的文件跑完才让位）；「单文件连接」指一个文件切几段同时拉，只对之后加入队列的任务生效。两个都调高更快，也更吃带宽。",
                     )
                     .size(11.5)
                     .color(p.weak),
@@ -2028,6 +2384,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let got_events = self.pump();
         self.flush_settings();
+        self.flush_tasks();
 
         if self.dark != palette_is_dark(ctx) {
             // 主题切换后立即重建样式，避免拖到下一帧才有反馈
@@ -2194,6 +2551,13 @@ impl eframe::App for App {
                 self.add_open = false;
             }
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Last chance to persist: the throttled writer may still be holding a
+        // change made in the final second before the window closed.
+        self.settings.save();
+        save_tasks(&self.tasks);
     }
 }
 
